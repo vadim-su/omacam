@@ -56,16 +56,20 @@ pub struct GpuEffects {
 
     p_nv12_to_rgba: wgpu::ComputePipeline,
     p_temporal_denoise: wgpu::ComputePipeline,
-    p_cnn_layer1: wgpu::ComputePipeline,
-    p_cnn_layer2: wgpu::ComputePipeline,
+    p_rl_ratio1: wgpu::ComputePipeline,
+    p_rl_update1: wgpu::ComputePipeline,
+    p_rl_ratio2: wgpu::ComputePipeline,
+    p_rl_update2: wgpu::ComputePipeline,
     p_prepare_half: wgpu::ComputePipeline,
     p_bokeh: wgpu::ComputePipeline,
     p_compose: wgpu::ComputePipeline,
 
     bg_nv12_to_rgba: wgpu::BindGroup,
     bg_temporal_denoise: wgpu::BindGroup,
-    bg_cnn_layer1: wgpu::BindGroup,
-    bg_cnn_layer2: wgpu::BindGroup,
+    bg_rl_ratio1: wgpu::BindGroup,
+    bg_rl_update1: wgpu::BindGroup,
+    bg_rl_ratio2: wgpu::BindGroup,
+    bg_rl_update2: wgpu::BindGroup,
     bg_prepare_half: wgpu::BindGroup,
     bg_bokeh: wgpu::BindGroup,
     bg_compose: wgpu::BindGroup,
@@ -243,8 +247,10 @@ impl GpuEffects {
 
         let p_nv12_to_rgba = create_pipeline(&device, &shader, "nv12_to_rgba");
         let p_temporal_denoise = create_pipeline(&device, &shader, "temporal_denoise");
-        let p_cnn_layer1 = create_pipeline(&device, &shader, "cnn_layer1");
-        let p_cnn_layer2 = create_pipeline(&device, &shader, "cnn_layer2");
+        let p_rl_ratio1 = create_pipeline(&device, &shader, "rl_ratio1");
+        let p_rl_update1 = create_pipeline(&device, &shader, "rl_update1");
+        let p_rl_ratio2 = create_pipeline(&device, &shader, "rl_ratio2");
+        let p_rl_update2 = create_pipeline(&device, &shader, "rl_update2");
         let p_prepare_half = create_pipeline(&device, &shader, "prepare_half_bg");
         let p_bokeh = create_pipeline(&device, &shader, "bokeh_blur");
         let p_compose = create_pipeline(&device, &shader, "compose_nv12");
@@ -313,13 +319,67 @@ impl GpuEffects {
             ],
         });
 
-        let bg_cnn_layer1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("bg-cnn-layer1"),
-            layout: &p_cnn_layer1.get_bind_group_layout(0),
+        let bg_rl_ratio1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("bg-rl-ratio1"),
+            layout: &p_rl_ratio1.get_bind_group_layout(0),
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
                     resource: uniform_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 16,
+                    resource: wgpu::BindingResource::TextureView(&clean_rgba_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 17,
+                    resource: wgpu::BindingResource::TextureView(&feat0_view),
+                },
+            ],
+        });
+
+        let bg_rl_update1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("bg-rl-update1"),
+            layout: &p_rl_update1.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 16,
+                    resource: wgpu::BindingResource::TextureView(&clean_rgba_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 18,
+                    resource: wgpu::BindingResource::TextureView(&feat1_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 19,
+                    resource: wgpu::BindingResource::TextureView(&feat0_view),
+                },
+            ],
+        });
+
+        let bg_rl_ratio2 = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("bg-rl-ratio2"),
+            layout: &p_rl_ratio2.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
                 },
                 wgpu::BindGroupEntry {
                     binding: 16,
@@ -330,23 +390,23 @@ impl GpuEffects {
                     resource: wgpu::BindingResource::TextureView(&feat0_view),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 18,
+                    binding: 20,
                     resource: wgpu::BindingResource::TextureView(&feat1_view),
                 },
             ],
         });
 
-        let bg_cnn_layer2 = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("bg-cnn-layer2"),
-            layout: &p_cnn_layer2.get_bind_group_layout(0),
+        let bg_rl_update2 = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("bg-rl-update2"),
+            layout: &p_rl_update2.get_bind_group_layout(0),
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
                     resource: uniform_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 16,
-                    resource: wgpu::BindingResource::TextureView(&clean_rgba_view),
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
                 },
                 wgpu::BindGroupEntry {
                     binding: 19,
@@ -480,15 +540,19 @@ impl GpuEffects {
             readback_buf,
             p_nv12_to_rgba,
             p_temporal_denoise,
-            p_cnn_layer1,
-            p_cnn_layer2,
+            p_rl_ratio1,
+            p_rl_update1,
+            p_rl_ratio2,
+            p_rl_update2,
             p_prepare_half,
             p_bokeh,
             p_compose,
             bg_nv12_to_rgba,
             bg_temporal_denoise,
-            bg_cnn_layer1,
-            bg_cnn_layer2,
+            bg_rl_ratio1,
+            bg_rl_update1,
+            bg_rl_ratio2,
+            bg_rl_update2,
             bg_prepare_half,
             bg_bokeh,
             bg_compose,
@@ -735,23 +799,41 @@ impl GpuEffects {
             },
         );
 
-        // Pass 1C & 1D: 2-Stage Residual Restoration CNN (always writes restored_rgba_tex)
+        // Pass 1C..1F: 2-Iteration Richardson-Lucy Optical Deconvolution
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("cnn-layer1"),
+                label: Some("rl-ratio1"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.p_cnn_layer1);
-            pass.set_bind_group(0, &self.bg_cnn_layer1, &[]);
+            pass.set_pipeline(&self.p_rl_ratio1);
+            pass.set_bind_group(0, &self.bg_rl_ratio1, &[]);
             pass.dispatch_workgroups(wg_x, wg_y, 1);
         }
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("cnn-layer2"),
+                label: Some("rl-update1"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.p_cnn_layer2);
-            pass.set_bind_group(0, &self.bg_cnn_layer2, &[]);
+            pass.set_pipeline(&self.p_rl_update1);
+            pass.set_bind_group(0, &self.bg_rl_update1, &[]);
+            pass.dispatch_workgroups(wg_x, wg_y, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("rl-ratio2"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.p_rl_ratio2);
+            pass.set_bind_group(0, &self.bg_rl_ratio2, &[]);
+            pass.dispatch_workgroups(wg_x, wg_y, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("rl-update2"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.p_rl_update2);
+            pass.set_bind_group(0, &self.bg_rl_update2, &[]);
             pass.dispatch_workgroups(wg_x, wg_y, 1);
         }
 

@@ -2,11 +2,11 @@ struct Uniforms {
     width: u32,
     height: u32,
     bg_mode: u32,        // 0 = None, 1 = Blur, 2 = Image, 3 = Color
-    frame_index: u32,    // 0 resets temporal denoiser history
+    frame_index: u32,    // 0 resets temporal history
     blur_strength: f32,  // 0.0..1.0
     studio_light: f32,   // 0.0..1.0
     bg_image_blur: f32,  // 0.0..1.0
-    sharpness: f32,      // 0.0..1.0 (Temporal Denoise + Residual CNN Restore + FidelityFX CAS + De-haze)
+    sharpness: f32,      // 0.0..1.0 (2-Iter Richardson-Lucy Optical Deconvolution + 3-Band CAS/Clarity)
     centroid: vec2<f32>, // normalized [0..1, 0..1] face focal point (in sensor coords)
     mask_size: vec2<f32>,// e.g. (768.0, 432.0) for ResNet50 Vulkan or (512.0, 288.0) for MobileNetV3
     bg_color: vec4<f32>, // rgb in 0..1
@@ -27,7 +27,7 @@ struct Uniforms {
 @group(0) @binding(11) var bokeh_in: texture_2d<f32>;
 @group(0) @binding(12) var<storage, read_write> nv12_out: array<u32>;
 @group(0) @binding(13) var fgr_tex: texture_2d<f32>;
-// Temporal Denoiser + 2-Stage Residual Restoration CNN textures
+// Temporal micro-stabilizer + 2-Iteration Richardson-Lucy Optical Deconvolution textures
 @group(0) @binding(14) var prev_clean_in: texture_2d<f32>;
 @group(0) @binding(15) var clean_rgba_out: texture_storage_2d<rgba8unorm, write>;
 @group(0) @binding(16) var clean_rgba_in: texture_2d<f32>;
@@ -66,8 +66,8 @@ fn nv12_to_rgba(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 // -----------------------------------------------------------------------------
-// Pass 1B: Motion-Adaptive Temporal GPU Denoiser (1920x1080, ~0.4 ms)
-// Accumulates previous clean frame on static/slow regions, instantly resets on motion.
+// Pass 1B: Ultra-Light Micro-Noise Stabilizer (avoids double-blur with aurora-camera-denoise)
+// Only settles tiny static grain (< 0.025); any real facial expression or motion uses 100% live frame.
 // -----------------------------------------------------------------------------
 @compute @workgroup_size(16, 16)
 fn temporal_denoise(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -83,161 +83,133 @@ fn temporal_denoise(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let prev = textureLoad(prev_clean_in, p, 0).rgb;
-
-    // Compare both center pixel AND 3x3 neighborhood mean so real motion rejects history
-    // immediately while zero-mean random sensor grain is smoothly averaged away.
-    let xm = max(p.x - 1, 0);
-    let xp = min(p.x + 1, i32(u.width) - 1);
-    let ym = max(p.y - 1, 0);
-    let yp = min(p.y + 1, i32(u.height) - 1);
-
-    let curr_avg = (
-        curr +
-        textureLoad(src_rgba_in, vec2<i32>(xm, p.y), 0).rgb +
-        textureLoad(src_rgba_in, vec2<i32>(xp, p.y), 0).rgb +
-        textureLoad(src_rgba_in, vec2<i32>(p.x, ym), 0).rgb +
-        textureLoad(src_rgba_in, vec2<i32>(p.x, yp), 0).rgb
-    ) * 0.2;
-
-    let prev_avg = (
-        prev +
-        textureLoad(prev_clean_in, vec2<i32>(xm, p.y), 0).rgb +
-        textureLoad(prev_clean_in, vec2<i32>(xp, p.y), 0).rgb +
-        textureLoad(prev_clean_in, vec2<i32>(p.x, ym), 0).rgb +
-        textureLoad(prev_clean_in, vec2<i32>(p.x, yp), 0).rgb
-    ) * 0.2;
-
-    let diff_center = length(curr - prev);
-    let diff_region = length(curr_avg - prev_avg);
-    let motion = max(diff_center * 0.65, diff_region * 1.45);
-
-    // Zero ghosting: history drops to 0.0 cleanly above motion threshold ~0.075
-    let static_conf = 1.0 - smoothstep(0.014, 0.075, motion);
-    let blend = static_conf * (0.28 + 0.18 * u.sharpness);
-    let denoised = mix(curr, prev, blend);
+    let diff = length(curr - prev);
+    let static_conf = 1.0 - smoothstep(0.008, 0.032, diff);
+    let denoised = mix(curr, prev, static_conf * 0.16);
 
     textureStore(clean_rgba_out, p, vec4<f32>(denoised, 1.0));
 }
 
 // -----------------------------------------------------------------------------
-// Pass 1C: Residual Restoration CNN Layer 1 (8-channel 3x3 Feature Extractor, Rgba16Float)
-// Extracts oriented fine-edge & micro-texture feature maps across 4 orientations + multi-scale structure.
+// Pass 1C..1F: 2-Iteration GPU Richardson-Lucy Optical Deconvolution (Rgba16Float)
+// Mathematically inverts the ~1.8px Gaussian optical/ISP softness of Linux apple-isp,
+// bringing soft eyes, eyelashes, beard, and hair back into crisp focus without harsh halos.
 // -----------------------------------------------------------------------------
-fn load_clean(ix: i32, iy: i32) -> vec3<f32> {
-    let cx = clamp(ix, 0, i32(u.width) - 1);
-    let cy = clamp(iy, 0, i32(u.height) - 1);
-    return textureLoad(clean_rgba_in, vec2<i32>(cx, cy), 0).rgb;
+fn gaussian9_clean(uv: vec2<f32>, step_uv: vec2<f32>) -> vec3<f32> {
+    let c  = textureSampleLevel(clean_rgba_in, lin_sampler, uv, 0.0).rgb;
+    let n  = textureSampleLevel(clean_rgba_in, lin_sampler, uv + vec2<f32>( 0.0,       -step_uv.y), 0.0).rgb;
+    let s  = textureSampleLevel(clean_rgba_in, lin_sampler, uv + vec2<f32>( 0.0,        step_uv.y), 0.0).rgb;
+    let w  = textureSampleLevel(clean_rgba_in, lin_sampler, uv + vec2<f32>(-step_uv.x,  0.0),       0.0).rgb;
+    let e  = textureSampleLevel(clean_rgba_in, lin_sampler, uv + vec2<f32>( step_uv.x,  0.0),       0.0).rgb;
+    let nw = textureSampleLevel(clean_rgba_in, lin_sampler, uv + vec2<f32>(-step_uv.x, -step_uv.y), 0.0).rgb;
+    let ne = textureSampleLevel(clean_rgba_in, lin_sampler, uv + vec2<f32>( step_uv.x, -step_uv.y), 0.0).rgb;
+    let sw = textureSampleLevel(clean_rgba_in, lin_sampler, uv + vec2<f32>(-step_uv.x,  step_uv.y), 0.0).rgb;
+    let se = textureSampleLevel(clean_rgba_in, lin_sampler, uv + vec2<f32>( step_uv.x,  step_uv.y), 0.0).rgb;
+    return c * 0.25 + (n + s + w + e) * 0.125 + (nw + ne + sw + se) * 0.0625;
 }
 
+fn gaussian9_feat0(uv: vec2<f32>, step_uv: vec2<f32>) -> vec3<f32> {
+    let c  = textureSampleLevel(feat0_in, lin_sampler, uv, 0.0).rgb;
+    let n  = textureSampleLevel(feat0_in, lin_sampler, uv + vec2<f32>( 0.0,       -step_uv.y), 0.0).rgb;
+    let s  = textureSampleLevel(feat0_in, lin_sampler, uv + vec2<f32>( 0.0,        step_uv.y), 0.0).rgb;
+    let w  = textureSampleLevel(feat0_in, lin_sampler, uv + vec2<f32>(-step_uv.x,  0.0),       0.0).rgb;
+    let e  = textureSampleLevel(feat0_in, lin_sampler, uv + vec2<f32>( step_uv.x,  0.0),       0.0).rgb;
+    let nw = textureSampleLevel(feat0_in, lin_sampler, uv + vec2<f32>(-step_uv.x, -step_uv.y), 0.0).rgb;
+    let ne = textureSampleLevel(feat0_in, lin_sampler, uv + vec2<f32>( step_uv.x, -step_uv.y), 0.0).rgb;
+    let sw = textureSampleLevel(feat0_in, lin_sampler, uv + vec2<f32>(-step_uv.x,  step_uv.y), 0.0).rgb;
+    let se = textureSampleLevel(feat0_in, lin_sampler, uv + vec2<f32>( step_uv.x,  step_uv.y), 0.0).rgb;
+    return c * 0.25 + (n + s + w + e) * 0.125 + (nw + ne + sw + se) * 0.0625;
+}
+
+fn gaussian9_feat1(uv: vec2<f32>, step_uv: vec2<f32>) -> vec3<f32> {
+    let c  = textureSampleLevel(feat1_in, lin_sampler, uv, 0.0).rgb;
+    let n  = textureSampleLevel(feat1_in, lin_sampler, uv + vec2<f32>( 0.0,       -step_uv.y), 0.0).rgb;
+    let s  = textureSampleLevel(feat1_in, lin_sampler, uv + vec2<f32>( 0.0,        step_uv.y), 0.0).rgb;
+    let w  = textureSampleLevel(feat1_in, lin_sampler, uv + vec2<f32>(-step_uv.x,  0.0),       0.0).rgb;
+    let e  = textureSampleLevel(feat1_in, lin_sampler, uv + vec2<f32>( step_uv.x,  0.0),       0.0).rgb;
+    let nw = textureSampleLevel(feat1_in, lin_sampler, uv + vec2<f32>(-step_uv.x, -step_uv.y), 0.0).rgb;
+    let ne = textureSampleLevel(feat1_in, lin_sampler, uv + vec2<f32>( step_uv.x, -step_uv.y), 0.0).rgb;
+    let sw = textureSampleLevel(feat1_in, lin_sampler, uv + vec2<f32>(-step_uv.x,  step_uv.y), 0.0).rgb;
+    let se = textureSampleLevel(feat1_in, lin_sampler, uv + vec2<f32>( step_uv.x,  step_uv.y), 0.0).rgb;
+    return c * 0.25 + (n + s + w + e) * 0.125 + (nw + ne + sw + se) * 0.0625;
+}
+
+// Pass 1C: Iteration 1 — compute ratio I_0 / (I_0 * G_1.85) into feat0 (HDR Rgba16Float)
 @compute @workgroup_size(16, 16)
-fn cnn_layer1(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn rl_ratio1(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= u.width || gid.y >= u.height) {
         return;
     }
-    let ix = i32(gid.x);
-    let iy = i32(gid.y);
-
-    // 3x3 luminance patch
-    let l00 = luma709(load_clean(ix - 1, iy - 1));
-    let l10 = luma709(load_clean(ix,     iy - 1));
-    let l20 = luma709(load_clean(ix + 1, iy - 1));
-    let l01 = luma709(load_clean(ix - 1, iy    ));
-    let l11 = luma709(load_clean(ix,     iy    ));
-    let l21 = luma709(load_clean(ix + 1, iy    ));
-    let l02 = luma709(load_clean(ix - 1, iy + 1));
-    let l12 = luma709(load_clean(ix,     iy + 1));
-    let l22 = luma709(load_clean(ix + 1, iy + 1));
-
-    // Oriented 3x3 filter bank (4 directional edge channels)
-    let gx   = (l20 + 2.0 * l21 + l22) - (l00 + 2.0 * l01 + l02);
-    let gy   = (l02 + 2.0 * l12 + l22) - (l00 + 2.0 * l10 + l20);
-    let gd1  = (l20 + 2.0 * l10 + l21) - (l02 + 2.0 * l12 + l01);
-    let gd2  = (l00 + 2.0 * l10 + l01) - (l22 + 2.0 * l12 + l21);
-
-    // High-frequency ridge / fine detail kernels (horizontal, vertical, isotropic Laplacian)
-    let ridge_h = l11 - 0.5 * (l01 + l21);
-    let ridge_v = l11 - 0.5 * (l10 + l12);
-    let lap     = l11 - 0.25 * (l10 + l01 + l21 + l12);
-    let local_range = max(max(max(l00, l20), max(l02, l22)), max(max(l10, l12), max(l01, l21)))
-                    - min(min(min(l00, l20), min(l02, l22)), min(min(l10, l12), min(l01, l21)));
-
-    // Leaky/soft-thresholded activations suppress sub-noise-floor grain while passing real edges
-    textureStore(feat0_out, vec2<i32>(ix, iy), vec4<f32>(abs(gx), abs(gy), abs(gd1), abs(gd2)));
-    textureStore(feat1_out, vec2<i32>(ix, iy), vec4<f32>(ridge_h, ridge_v, lap, local_range));
+    let inv = vec2<f32>(1.0 / f32(u.width), 1.0 / f32(u.height));
+    let uv = (vec2<f32>(gid.xy) + vec2<f32>(0.5)) * inv;
+    let orig = textureLoad(clean_rgba_in, vec2<i32>(gid.xy), 0).rgb;
+    let blur = gaussian9_clean(uv, inv * 1.85);
+    let ratio = clamp((orig + vec3<f32>(0.02)) / (blur + vec3<f32>(0.02)), vec3<f32>(0.70), vec3<f32>(1.42));
+    // Store local edge energy in .a so flat noisy patches don't amplify grain
+    let edge_energy = length(orig - blur);
+    textureStore(feat0_out, vec2<i32>(gid.xy), vec4<f32>(ratio, edge_energy));
 }
 
-// -----------------------------------------------------------------------------
-// Pass 1D: Residual Restoration CNN Layer 2 (3x3 Spatial Feature Mixing -> Deblurred Residual)
-// Coherently restores optical micro-edges (eyes, hair, beard) while gating isolated noise.
-// -----------------------------------------------------------------------------
-fn load_f0(ix: i32, iy: i32) -> vec4<f32> {
-    let cx = clamp(ix, 0, i32(u.width) - 1);
-    let cy = clamp(iy, 0, i32(u.height) - 1);
-    return textureLoad(feat0_in, vec2<i32>(cx, cy), 0);
-}
-
-fn load_f1(ix: i32, iy: i32) -> vec4<f32> {
-    let cx = clamp(ix, 0, i32(u.width) - 1);
-    let cy = clamp(iy, 0, i32(u.height) - 1);
-    return textureLoad(feat1_in, vec2<i32>(cx, cy), 0);
-}
-
-fn soft_shrink(x: f32, tau: f32) -> f32 {
-    return sign(x) * max(abs(x) - tau, 0.0);
-}
-
+// Pass 1D: Iteration 1 — update I_1 = I_0 * (ratio1 * G_1.85) into feat1 (Rgba16Float)
 @compute @workgroup_size(16, 16)
-fn cnn_layer2(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn rl_update1(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= u.width || gid.y >= u.height) {
         return;
     }
-    let ix = i32(gid.x);
-    let iy = i32(gid.y);
-    let base = textureLoad(clean_rgba_in, vec2<i32>(ix, iy), 0).rgb;
+    let inv = vec2<f32>(1.0 / f32(u.width), 1.0 / f32(u.height));
+    let uv = (vec2<f32>(gid.xy) + vec2<f32>(0.5)) * inv;
+    let orig = textureLoad(clean_rgba_in, vec2<i32>(gid.xy), 0).rgb;
 
     if (u.sharpness <= 0.01) {
-        textureStore(restored_rgba_out, vec2<i32>(ix, iy), vec4<f32>(base, 1.0));
+        textureStore(feat1_out, vec2<i32>(gid.xy), vec4<f32>(orig, 1.0));
         return;
     }
 
-    // Spatial coherence across 3x3 feature maps: real edges are continuous along neighbors,
-    // random sensor noise is isolated and fails the coherence gate.
-    let f0_c = load_f0(ix, iy);
-    let f0_n = load_f0(ix, iy - 1);
-    let f0_s = load_f0(ix, iy + 1);
-    let f0_w = load_f0(ix - 1, iy);
-    let f0_e = load_f0(ix + 1, iy);
+    let corr = gaussian9_feat0(uv, inv * 1.85);
+    let energy = textureLoad(feat0_in, vec2<i32>(gid.xy), 0).a;
+    // Sensitive gate (0.012..0.045) passes soft facial details while suppressing flat sensor grain
+    let gate = smoothstep(0.010, 0.042, energy);
+    let factor = mix(vec3<f32>(1.0), corr, u.sharpness * (0.35 + 0.65 * gate));
+    let i1 = clamp(orig * factor, vec3<f32>(0.0), vec3<f32>(1.0));
+    textureStore(feat1_out, vec2<i32>(gid.xy), vec4<f32>(i1, energy));
+}
 
-    let f1_c = load_f1(ix, iy);
-    let f1_n = load_f1(ix, iy - 1);
-    let f1_s = load_f1(ix, iy + 1);
-    let f1_w = load_f1(ix - 1, iy);
-    let f1_e = load_f1(ix + 1, iy);
+// Pass 1E: Iteration 2 — compute ratio I_0 / (I_1 * G_1.45) into feat0 (HDR Rgba16Float)
+@compute @workgroup_size(16, 16)
+fn rl_ratio2(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= u.width || gid.y >= u.height) {
+        return;
+    }
+    let inv = vec2<f32>(1.0 / f32(u.width), 1.0 / f32(u.height));
+    let uv = (vec2<f32>(gid.xy) + vec2<f32>(0.5)) * inv;
+    let orig = textureLoad(clean_rgba_in, vec2<i32>(gid.xy), 0).rgb;
+    let blur = gaussian9_feat1(uv, inv * 1.45);
+    let ratio = clamp((orig + vec3<f32>(0.02)) / (blur + vec3<f32>(0.02)), vec3<f32>(0.76), vec3<f32>(1.32));
+    let energy = textureLoad(feat1_in, vec2<i32>(gid.xy), 0).a;
+    textureStore(feat0_out, vec2<i32>(gid.xy), vec4<f32>(ratio, energy));
+}
 
-    // Directional coherence score: vertical edges continue N/S (f0.x), horizontal edges continue W/E (f0.y)
-    let coh_v = min(f0_c.x, 0.5 * (f0_n.x + f0_s.x));
-    let coh_h = min(f0_c.y, 0.5 * (f0_w.y + f0_e.y));
-    let coh_d = 0.5 * (f0_c.z + f0_c.w);
-    let edge_coherence = smoothstep(0.035, 0.22, max(max(coh_v, coh_h), coh_d * 0.75));
+// Pass 1F: Iteration 2 — update I_2 = I_1 * (ratio2 * G_1.45) into restored_rgba (Rgba8Unorm)
+@compute @workgroup_size(16, 16)
+fn rl_update2(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= u.width || gid.y >= u.height) {
+        return;
+    }
+    let inv = vec2<f32>(1.0 / f32(u.width), 1.0 / f32(u.height));
+    let uv = (vec2<f32>(gid.xy) + vec2<f32>(0.5)) * inv;
+    let i1_pack = textureLoad(feat1_in, vec2<i32>(gid.xy), 0);
+    let i1 = i1_pack.rgb;
 
-    // Mix ridge & Laplacian residuals along coherent directions (soft-thresholded against grain)
-    let tau = 0.008;
-    let d_h = soft_shrink(f1_c.x * 0.65 + 0.175 * (f1_n.x + f1_s.x), tau);
-    let d_v = soft_shrink(f1_c.y * 0.65 + 0.175 * (f1_w.y + f1_e.y), tau);
-    let d_iso = soft_shrink(f1_c.z, tau * 1.2);
+    if (u.sharpness <= 0.01) {
+        textureStore(restored_rgba_out, vec2<i32>(gid.xy), vec4<f32>(i1, 1.0));
+        return;
+    }
 
-    // Anti-halo damping on ultra-high-contrast edges (prevents white outline on dark hair/glasses)
-    let contrast_damp = 1.0 - smoothstep(0.32, 0.68, f1_c.w) * 0.55;
-
-    let residual_luma = clamp(
-        (d_h * 0.45 + d_v * 0.45 + d_iso * 0.55) * edge_coherence * contrast_damp * (1.25 * u.sharpness),
-        -0.11,
-        0.11
-    );
-
-    // Apply luma-preserving restoration residual
-    let restored = clamp(base + vec3<f32>(residual_luma), vec3<f32>(0.0), vec3<f32>(1.0));
-    textureStore(restored_rgba_out, vec2<i32>(ix, iy), vec4<f32>(restored, 1.0));
+    let corr = gaussian9_feat0(uv, inv * 1.45);
+    let gate = smoothstep(0.010, 0.042, i1_pack.a);
+    let factor = mix(vec3<f32>(1.0), corr, u.sharpness * 0.85 * (0.30 + 0.70 * gate));
+    let i2 = clamp(i1 * factor, vec3<f32>(0.0), vec3<f32>(1.0));
+    textureStore(restored_rgba_out, vec2<i32>(gid.xy), vec4<f32>(i2, 1.0));
 }
 
 // -----------------------------------------------------------------------------
@@ -349,7 +321,7 @@ fn bokeh_blur(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // -----------------------------------------------------------------------------
 // Pass 4: Center Stage Bicubic Zoom + 768x432 Edge-Guided Matting + RVM Decontam +
-//         FidelityFX CAS + Clarity + De-Haze + Studio Light + Rec. 709 NV12 Packer
+//         3-Band Apple-ISP Clarity & CAS + Studio Light + Rec. 709 NV12 Packer
 // -----------------------------------------------------------------------------
 fn sample_restored_crisp(uv: vec2<f32>) -> vec3<f32> {
     let tex_size = vec2<f32>(f32(u.width), f32(u.height));
@@ -392,7 +364,6 @@ fn sample_sensor_restored(src_uv: vec2<f32>) -> vec3<f32> {
     return sample_restored_crisp(src_uv);
 }
 
-/// Joint Bilateral (Edge-Guided) alpha refinement adapted to dynamic mask_size (768x432 or 512x288).
 fn sample_guided_alpha(src_uv: vec2<f32>, center_rgb: vec3<f32>) -> f32 {
     let c_alpha = textureSampleLevel(alpha_tex, lin_sampler, src_uv, 0.0).r;
     if (c_alpha < 0.02 || c_alpha > 0.98) {
@@ -426,8 +397,10 @@ fn sample_guided_alpha(src_uv: vec2<f32>, center_rgb: vec3<f32>) -> f32 {
     return smoothstep(0.025, 0.965, refined);
 }
 
-/// Final foreground polish on top of Temporal Denoise + Residual CNN:
-/// FidelityFX CAS + Local Clarity + Black-point de-haze.
+/// 3-Band Apple-ISP Polish on top of 2-Iteration Richardson-Lucy Optical Deconvolution:
+/// - Band 1: 1px FidelityFX CAS (fine micro-crispness)
+/// - Band 2: 2.8px optical detail contrast
+/// - Band 3: 6.0px local Clarity / de-haze (matches Apple ISP tone pop)
 fn polish_foreground(src_uv: vec2<f32>, center: vec3<f32>) -> vec3<f32> {
     let s = u.sharpness;
     if (s <= 0.01) {
@@ -436,6 +409,7 @@ fn polish_foreground(src_uv: vec2<f32>, center: vec3<f32>) -> vec3<f32> {
 
     let step_uv = vec2<f32>(1.0 / f32(u.width), 1.0 / f32(u.height)) / max(u.crop.z, 1.0);
 
+    // Band 1: FidelityFX CAS (1px)
     let a = textureSampleLevel(restored_rgba_in, lin_sampler, src_uv + vec2<f32>(-step_uv.x, -step_uv.y), 0.0).rgb;
     let b = textureSampleLevel(restored_rgba_in, lin_sampler, src_uv + vec2<f32>( 0.0,       -step_uv.y), 0.0).rgb;
     let c = textureSampleLevel(restored_rgba_in, lin_sampler, src_uv + vec2<f32>( step_uv.x, -step_uv.y), 0.0).rgb;
@@ -455,7 +429,7 @@ fn polish_foreground(src_uv: vec2<f32>, center: vec3<f32>) -> vec3<f32> {
 
     let rcp_mx = vec3<f32>(1.0) / max(mx_rgb, vec3<f32>(1e-4));
     let amp = sqrt(clamp(min(mn_rgb, vec3<f32>(1.0) - mx_rgb) * rcp_mx, vec3<f32>(0.0), vec3<f32>(1.0)));
-    let peak = -mix(0.0, 0.175, s);
+    let peak = -mix(0.0, 0.195, s);
     let w_cas = amp * peak;
 
     let cas_rgb = clamp(
@@ -464,25 +438,40 @@ fn polish_foreground(src_uv: vec2<f32>, center: vec3<f32>) -> vec3<f32> {
         vec3<f32>(1.0)
     );
 
-    // Subtle mid-radius Clarity
-    let r2 = step_uv * 2.5;
+    // Band 2: Mid-radius optical detail (2.8px)
+    let r2 = step_uv * 2.8;
     let blur_mid = (
         textureSampleLevel(restored_rgba_in, lin_sampler, src_uv + vec2<f32>( r2.x,  r2.y), 0.0).rgb +
         textureSampleLevel(restored_rgba_in, lin_sampler, src_uv + vec2<f32>(-r2.x,  r2.y), 0.0).rgb +
         textureSampleLevel(restored_rgba_in, lin_sampler, src_uv + vec2<f32>( r2.x, -r2.y), 0.0).rgb +
         textureSampleLevel(restored_rgba_in, lin_sampler, src_uv + vec2<f32>(-r2.x, -r2.y), 0.0).rgb
     ) * 0.25;
-    let detail_mid = clamp(cas_rgb - blur_mid, vec3<f32>(-0.10), vec3<f32>(0.10));
-    var out_c = clamp(cas_rgb + detail_mid * (0.32 * s), vec3<f32>(0.0), vec3<f32>(1.0));
+    let detail_mid = clamp(cas_rgb - blur_mid, vec3<f32>(-0.14), vec3<f32>(0.14));
 
-    // Black-point de-haze & gentle filmic micro-contrast
-    let black_floor = 0.032 * s;
+    // Band 3: Broad local clarity (6.0px) — restores Apple ISP micro-contrast across facial features
+    let r3 = step_uv * 6.0;
+    let blur_wide = (
+        textureSampleLevel(restored_rgba_in, lin_sampler, src_uv + vec2<f32>( r3.x,  0.0),  0.0).rgb +
+        textureSampleLevel(restored_rgba_in, lin_sampler, src_uv + vec2<f32>(-r3.x,  0.0),  0.0).rgb +
+        textureSampleLevel(restored_rgba_in, lin_sampler, src_uv + vec2<f32>( 0.0,   r3.y), 0.0).rgb +
+        textureSampleLevel(restored_rgba_in, lin_sampler, src_uv + vec2<f32>( 0.0,  -r3.y), 0.0).rgb
+    ) * 0.25;
+    let detail_wide = clamp(cas_rgb - blur_wide, vec3<f32>(-0.12), vec3<f32>(0.12));
+
+    var out_c = clamp(
+        cas_rgb + detail_mid * (0.42 * s) + detail_wide * (0.28 * s),
+        vec3<f32>(0.0),
+        vec3<f32>(1.0)
+    );
+
+    // Black-point de-haze & gentle filmic S-curve
+    let black_floor = 0.038 * s;
     out_c = clamp((out_c - vec3<f32>(black_floor)) / (1.0 - black_floor), vec3<f32>(0.0), vec3<f32>(1.0));
     let s_curve = out_c * out_c * (3.0 - 2.0 * out_c);
-    out_c = mix(out_c, s_curve, 0.16 * s);
+    out_c = mix(out_c, s_curve, 0.20 * s);
 
     let lum = luma709(out_c);
-    out_c = clamp(mix(vec3<f32>(lum), out_c, 1.0 + 0.07 * s), vec3<f32>(0.0), vec3<f32>(1.0));
+    out_c = clamp(mix(vec3<f32>(lum), out_c, 1.0 + 0.08 * s), vec3<f32>(0.0), vec3<f32>(1.0));
     return out_c;
 }
 

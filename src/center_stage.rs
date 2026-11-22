@@ -347,11 +347,11 @@ impl CenterStageController {
         // genuine pan margin even when sitting close to a MacBook Pro (1.18x .. 1.60x floor),
         // while zooming smoothly out to 1.0x whenever 2+ people are in frame.
         let min_zoom = if faces.len() == 1 {
-            1.18 + zp * 0.42
+            1.12 + zp * 0.38
         } else {
             1.0
         };
-        let max_zoom = 1.40 + zp * 0.75;
+        let max_zoom = 1.35 + zp * 0.65;
 
         // Target face height scales with zoom preference (~36%..50% for single portrait)
         let desired_face_h = if faces.len() == 1 {
