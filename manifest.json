@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "vadim-su.omacam",
+  "name": "Omacam Studio",
+  "version": "1.0.0",
+  "author": "vadim-su",
+  "description": "macOS-style Portrait Mode, Center Stage, Studio Light, neural sharpness, and virtual background controls for Linux / Omarchy",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Omacam Studio",
+    "description": "Camera effects: Center Stage, Portrait Bokeh, Studio Light, Sharpness & Background",
+    "category": "Tools",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

@@ -1,0 +1,14 @@
+[Unit]
+Description=Omacam Studio Virtual Camera Daemon (Vulkan RVM ResNet50, Center Stage, Studio Light & Neural Clarity)
+After=pipewire.service wireplumber.service graphical-session.target
+Wants=pipewire.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/omacam
+Restart=on-failure
+RestartSec=2
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=default.target

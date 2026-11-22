@@ -1,0 +1,13 @@
+/target
+/models
+/vendor
+/tools
+*.onnx
+*.ncnn.bin
+*.ncnn.param
+*.pnnx.bin
+*.pnnx.param
+*.pnnx.onnx
+*_pnnx.py
+*_ncnn.py
+.DS_Store
